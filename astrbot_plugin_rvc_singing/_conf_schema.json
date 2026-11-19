@@ -1,0 +1,6 @@
+{
+  "gateway_url": {"description": "网关地址", "type": "string", "default": "http://127.0.0.1:9002"},
+  "gateway_token": {"description": "网关令牌", "type": "string", "default": "", "secret": true},
+  "start": {"description": "开始秒数", "type": "int", "default": 0, "hint": "满60秒后寻找静音句尾，最长300秒；短歌自动前移起点。"},
+  "pitch": {"description": "升降半音", "type": "int", "default": 0, "hint": "0跟随原曲音高。"}
+}

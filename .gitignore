@@ -1,0 +1,8 @@
+__pycache__/
+.venv/
+.ruff_cache/
+.pytest_cache/
+*.env
+*.sqlite3*
+deployment-private/
+audio-tests/

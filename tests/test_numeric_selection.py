@@ -23,6 +23,9 @@ def plugin(now, selections):
             "select",
             "select_number",
             "confirm_song_tool",
+            "repeat",
+            "vocals",
+            "accompanied",
         }:
             node.decorator_list = []
             if node.name == "argument":
@@ -31,17 +34,27 @@ def plugin(now, selections):
     cls.body = methods
     cls.decorator_list = []
     cls.bases = []
-    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
+    constants = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id in {"SELECTION_TTL", "VERSION_TTL"}
+            for target in node.targets
+        )
+    ]
+    module = ast.fix_missing_locations(ast.Module(body=[*constants, cls], type_ignores=[]))
     scope = {
         "re": re,
         "AstrMessageEvent": object,
-        "SELECTION_TTL": 60,
         "time": SimpleNamespace(time=lambda: now),
     }
     exec(compile(module, str(SOURCE), "exec"), scope)
     obj = scope[cls.name]()
-    obj.state = {"selections": selections}
+    obj.state = {"selections": selections, "last": {}}
     obj.accept = AsyncMock(return_value="accepted")
+    obj.send_audio = AsyncMock()
+    obj.persist = lambda: None
     obj.describe = str
     return obj
 
@@ -75,7 +88,7 @@ def collect(handler, event):
 
 @pytest.mark.parametrize(("number", "source"), [("1", "first"), ("2", "second")])
 def test_plain_number_selects_same_sender_in_same_conversation(number, source):
-    obj = plugin(159, {"group-a|user-a": selection()})
+    obj = plugin(219, {"group-a|user-a": selection()})
     event = Event(number)
     assert collect(obj.select_number, event) == ["accepted"]
     obj.accept.assert_awaited_once_with(event, source, selection()["options"])
@@ -87,8 +100,8 @@ def test_plain_number_selects_same_sender_in_same_conversation(number, source):
     [
         ("group-a", "user-b", 120),
         ("group-b", "user-a", 120),
-        ("group-a", "user-a", 160),
-        ("group-a", "user-a", 161),
+        ("group-a", "user-a", 220),
+        ("group-a", "user-a", 221),
     ],
 )
 def test_other_users_conversations_and_expired_numbers_pass_through(
@@ -109,7 +122,7 @@ def test_number_without_selection_passes_through():
     obj.accept.assert_not_awaited()
 
 
-@pytest.mark.parametrize("number", ["0", "3", "999"])
+@pytest.mark.parametrize("number", ["3", "999"])
 def test_out_of_range_number_does_not_submit(number):
     obj = plugin(120, {"group-a|user-a": selection()})
     event = Event(number)
@@ -118,10 +131,23 @@ def test_out_of_range_number_does_not_submit(number):
     obj.accept.assert_not_awaited()
 
 
-@pytest.mark.parametrize("now", [160, 161])
-def test_tool_and_command_share_one_minute_expiry(now):
+def test_zero_clears_current_selection():
+    selections = {"group-a|user-a": selection(), "group-a|user-b": selection()}
+    obj = plugin(219, selections)
+    event = Event("0")
+    assert collect(obj.select_number, event) == ["已退出选歌。"]
+    assert event.stopped
+    assert selections == {"group-a|user-b": selection()}
+    assert collect(obj.select_number, Event("1")) == []
+    obj.accept.assert_not_awaited()
+
+
+@pytest.mark.parametrize("now", [220, 221])
+def test_tool_and_command_share_two_minute_expiry(now):
     obj = plugin(now, {"group-a|user-a": selection()})
-    assert "1 分钟" in collect(obj.select, Event("选歌 1"))[0]
+    event = Event("选歌 1")
+    assert collect(obj.select, event) == []
+    assert event.stopped
     result = asyncio.run(obj.confirm_song_tool(Event("1"), 1))
     assert "有效候选" in result
     obj.accept.assert_not_awaited()
@@ -132,6 +158,24 @@ def test_legacy_command_still_selects():
     event = Event("/选歌 2")
     assert collect(obj.select, event) == ["accepted"]
     obj.accept.assert_awaited_once_with(event, "second", selection()["options"])
+
+
+@pytest.mark.parametrize(("command", "kind"), [("vocals", "vocals"), ("accompanied", "mixed")])
+@pytest.mark.parametrize("now", [699, 700, 701])
+def test_version_commands_stop_chat_and_only_send_within_ten_minutes(command, kind, now):
+    obj = plugin(now, {})
+    obj.state["last"]["group-a|user-a"] = {
+        "job_id": "song-id",
+        "title": "song",
+        "completed_at": 100,
+    }
+    event = Event(command)
+    assert collect(getattr(obj, command), event) == []
+    assert event.stopped
+    if now < 700:
+        obj.send_audio.assert_awaited_once_with("group-a", "song-id", kind, "song")
+    else:
+        obj.send_audio.assert_not_awaited()
 
 
 def test_regex_only_matches_bare_ascii_numbers():

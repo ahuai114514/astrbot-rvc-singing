@@ -174,6 +174,8 @@ class Jobs:
             "created",
         )
         result = {k: job[k] for k in keys if k in job}
+        if job["status"] == "success":
+            result["completed_at"] = job["updated"]
         result["stage"] = STAGES.get(job["stage"], job["stage"])
         result["available"] = self.available(job)
         return result

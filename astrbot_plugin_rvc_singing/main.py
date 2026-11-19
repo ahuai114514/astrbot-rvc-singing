@@ -17,17 +17,17 @@ from astrbot.core.config.astrbot_config import AstrBotConfig
 
 HELP = (
     "角色唱歌\n"
-    "/点歌 歌名：搜索后1分钟内直接回复序号选择版本\n"
+    "/点歌 歌名：搜索后120秒内回复序号选歌，回复0退出\n"
     "/点歌 B站链接：直接生成，默认带伴奏\n"
     "默认从头唱，满60秒后寻找静音句尾，最长300秒\n"
     "末尾可加：纯人声、从60秒、升调2 或 降调2\n"
     "/唱歌进度：查看当前任务\n"
-    "/纯人声：获取上一首纯人声，不重新生成\n"
-    "/带伴奏：获取上一首带伴奏版本\n"
+    "/纯人声、/带伴奏：生成成功后10分钟内获取对应版本\n"
     "示例：/点歌 BV1LiVKzFEVf 从60秒"
 )
 OPTIONS = re.compile(r"(?:从\s*(\d+)\s*秒|(升调|降调)\s*(\d+)|纯人声|带伴奏)\s*$")
-SELECTION_TTL = 60
+SELECTION_TTL = 120
+VERSION_TTL = 600
 
 
 def parse_request(text: str, defaults: dict) -> tuple[str, dict]:
@@ -50,7 +50,7 @@ def parse_request(text: str, defaults: dict) -> tuple[str, dict]:
     return text, options
 
 
-@register("astrbot_plugin_rvc_singing", "ahuai", "角色音色翻唱，支持B站点歌", "1.2.0")
+@register("astrbot_plugin_rvc_singing", "ahuai", "角色音色翻唱，支持B站点歌", "1.2.1")
 class RVCSinging(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -170,7 +170,7 @@ class RVCSinging(Star):
             "created": time.time(),
         }
         self.persist()
-        return "选一个演唱版本，1分钟内直接回复序号（如 1、2）：\n" + "\n".join(
+        return "120秒内回复序号选择演唱版本，回复0退出：\n" + "\n".join(
             f"{i}. {r['title']}\n   {r['author']} · {r['duration']}\n   {r['url']}"
             for i, r in enumerate(results, 1)
         )
@@ -208,7 +208,7 @@ class RVCSinging(Star):
             pending["job_id"] = job["id"]
             self.persist()
             self.tasks[owner] = asyncio.create_task(self.watch(owner, pending))
-            return "正在生成，最长300秒，可用 /唱歌进度 查看。\n生成后可用 /纯人声 或 /带伴奏 切换版本，无需重新生成。"
+            return "正在生成，最长300秒，可用 /唱歌进度 查看。\n生成成功后10分钟内可用 /纯人声 或 /带伴奏 获取对应版本。"
 
     async def submit(self, pending: dict):
         options = pending["options"]
@@ -264,6 +264,7 @@ class RVCSinging(Star):
                     self.state["last"][owner] = {
                         "job_id": job["id"],
                         "title": job["title"],
+                        "completed_at": job.get("completed_at", time.time()),
                     }
                     self.persist()
                     await self.send_audio(
@@ -337,18 +338,23 @@ class RVCSinging(Star):
         selection = self.state["selections"].get(self.owner(event))
         if not selection or time.time() - selection["created"] >= SELECTION_TTL:
             return
-        event.stop_event()
         async for result in self.select(event):
             yield result
 
     @filter.command("选歌")
     async def select(self, event: AstrMessageEvent):
+        event.stop_event()
         try:
-            selection = self.state["selections"].get(self.owner(event))
+            owner = self.owner(event)
+            selection = self.state["selections"].get(owner)
             if not selection or time.time() - selection["created"] >= SELECTION_TTL:
-                yield event.plain_result("请先 /点歌 歌名 搜索，候选版本保留 1 分钟。")
                 return
             value = self.argument(event, "选歌")
+            if value == "0":
+                self.state["selections"].pop(owner)
+                self.persist()
+                yield event.plain_result("已退出选歌。")
+                return
             if not value.isdigit() or not 1 <= int(value) <= len(selection["results"]):
                 yield event.plain_result("请直接回复候选列表中的序号，例如 1")
                 return
@@ -376,9 +382,13 @@ class RVCSinging(Star):
             yield event.plain_result(self.describe(error))
 
     async def repeat(self, event: AstrMessageEvent, kind: str):
+        event.stop_event()
         last = self.state["last"].get(self.owner(event))
         if not last:
             yield event.plain_result("还没有生成过歌曲，先用 /点歌。")
+            return
+        completed_at = last.get("completed_at")
+        if completed_at is None or time.time() - completed_at >= VERSION_TTL:
             return
         try:
             await self.send_audio(

@@ -14,6 +14,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import File, Plain, Record
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.core.platform.message_type import MessageType
 
 HELP = (
     "角色唱歌\n"
@@ -23,6 +24,7 @@ HELP = (
     "末尾可加：纯人声、从60秒、升调2 或 降调2\n"
     "/唱歌进度：查看当前任务\n"
     "/纯人声、/带伴奏：生成成功后10分钟内获取对应版本\n"
+    "/点歌转发 群号或QQ号：10分钟内转发你的上一首\n"
     "示例：/点歌 BV1LiVKzFEVf 从60秒"
 )
 OPTIONS = re.compile(r"(?:从\s*(\d+)\s*秒|(升调|降调)\s*(\d+)|纯人声|带伴奏)\s*$")
@@ -50,7 +52,7 @@ def parse_request(text: str, defaults: dict) -> tuple[str, dict]:
     return text, options
 
 
-@register("astrbot_plugin_rvc_singing", "ahuai", "角色音色翻唱，支持B站点歌", "1.2.1")
+@register("astrbot_plugin_rvc_singing", "ahuai", "角色音色翻唱，支持B站点歌", "1.2.2")
 class RVCSinging(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -125,7 +127,7 @@ class RVCSinging(Star):
             base = str(self.config.get("gateway_url", "http://127.0.0.1:9002")).rstrip(
                 "/"
             )
-            part = target.with_suffix(".part")
+            part = target.with_suffix(f".{uuid.uuid4().hex}.part")
             try:
                 async with self.client.stream(
                     "GET",
@@ -148,16 +150,18 @@ class RVCSinging(Star):
             finally:
                 part.unlink(missing_ok=True)
         try:
-            await self.context.send_message(
+            sent = await self.context.send_message(
                 origin, MessageChain([Record.fromFileSystem(str(target))])
             )
         except Exception:
             title = re.sub(r'[\\/:*?"<>|]', "_", title)[:70] or "角色翻唱"
             suffix = "纯人声" if kind == "vocals" else "带伴奏"
-            await self.context.send_message(
+            sent = await self.context.send_message(
                 origin,
                 MessageChain([File(file=str(target), name=f"{title}-{suffix}.mp3")]),
             )
+        if sent is False:
+            raise ValueError("找不到目标会话对应的机器人连接")
 
     async def search(self, event: AstrMessageEvent, keyword: str, options: dict) -> str:
         data = await self.request("GET", "/v1/search", params={"q": keyword})
@@ -264,6 +268,7 @@ class RVCSinging(Star):
                     self.state["last"][owner] = {
                         "job_id": job["id"],
                         "title": job["title"],
+                        "kind": pending["options"]["kind"],
                         "completed_at": job.get("completed_at", time.time()),
                     }
                     self.persist()
@@ -406,6 +411,56 @@ class RVCSinging(Star):
     async def accompanied(self, event: AstrMessageEvent):
         async for result in self.repeat(event, "mixed"):
             yield result
+
+    @filter.command("点歌转发")
+    async def forward_song(self, event: AstrMessageEvent):
+        event.stop_event()
+        if event.get_platform_name() != "aiocqhttp":
+            yield event.plain_result("点歌转发目前仅支持 OneBot QQ。")
+            return
+
+        target = re.fullmatch(
+            r"(?:(群|QQ)\s*)?([1-9][0-9]{0,19})",
+            self.argument(event, "点歌转发"),
+            re.IGNORECASE,
+        )
+        if not target:
+            yield event.plain_result("用法：/点歌转发 群号或QQ号，例如 /点歌转发 123456789")
+            return
+
+        last = self.state["last"].get(self.owner(event))
+        if not last or time.time() - (last.get("completed_at") or 0) >= VERSION_TTL:
+            yield event.plain_result("请在原会话点歌，并在生成成功后10分钟内转发。")
+            return
+
+        try:
+            target_type, target_id = target.groups()
+            routes = []
+            if target_type in {None, "群"}:
+                groups = await event.bot.call_action("get_group_list")
+                if any(str(group["group_id"]) == target_id for group in groups):
+                    routes.append(MessageType.GROUP_MESSAGE)
+            if target_type != "群":
+                friends = await event.bot.call_action("get_friend_list")
+                if any(str(friend["user_id"]) == target_id for friend in friends):
+                    routes.append(MessageType.FRIEND_MESSAGE)
+            if not routes:
+                yield event.plain_result("找不到目标。机器人需要已加入该群或已添加该 QQ 为好友。")
+                return
+            if len(routes) > 1:
+                yield event.plain_result(
+                    f"群号和QQ号重复，请用 /点歌转发 群 {target_id} 或 /点歌转发 QQ {target_id}。"
+                )
+                return
+            origin = f"{event.get_platform_id()}:{routes[0].value}:{target_id}"
+            await self.send_audio(
+                origin, last["job_id"], last.get("kind", "mixed"), last["title"]
+            )
+        except Exception as error:
+            yield event.plain_result(f"转发失败：{self.describe(error)}")
+        else:
+            label = "群" if routes[0] == MessageType.GROUP_MESSAGE else "QQ"
+            yield event.plain_result(f"已转发到{label} {target_id}。")
 
     @filter.command("点歌帮助")
     async def help(self, event: AstrMessageEvent):

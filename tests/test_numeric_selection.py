@@ -26,6 +26,7 @@ def plugin(now, selections):
             "repeat",
             "vocals",
             "accompanied",
+            "forward_song",
         }:
             node.decorator_list = []
             if node.name == "argument":
@@ -47,6 +48,10 @@ def plugin(now, selections):
     scope = {
         "re": re,
         "AstrMessageEvent": object,
+        "MessageType": SimpleNamespace(
+            GROUP_MESSAGE=SimpleNamespace(value="GroupMessage"),
+            FRIEND_MESSAGE=SimpleNamespace(value="FriendMessage"),
+        ),
         "time": SimpleNamespace(time=lambda: now),
     }
     exec(compile(module, str(SOURCE), "exec"), scope)
@@ -158,6 +163,56 @@ def test_legacy_command_still_selects():
     event = Event("/选歌 2")
     assert collect(obj.select, event) == ["accepted"]
     obj.accept.assert_awaited_once_with(event, "second", selection()["options"])
+
+
+@pytest.mark.parametrize(
+    ("argument", "group_id", "friend_id", "expected"),
+    [
+        ("123", 123, 456, "GroupMessage"),
+        ("123", 456, 123, "FriendMessage"),
+        ("群 123", 123, 123, "GroupMessage"),
+        ("qq 123", 123, 123, "FriendMessage"),
+        ("123", 123, 123, "重复"),
+        ("123", 456, 456, "找不到目标"),
+    ],
+)
+def test_forward_routes_last_song(argument, group_id, friend_id, expected):
+    obj = plugin(120, {})
+    obj.state["last"]["group-a|user-a"] = {
+        "job_id": "song-id",
+        "title": "song",
+        "kind": "vocals",
+        "completed_at": 100,
+    }
+    event = Event(f"/点歌转发 {argument}")
+    event.get_platform_name = lambda: "aiocqhttp"
+    event.get_platform_id = lambda: "qq-custom"
+    targets = {
+        "get_group_list": [{"group_id": group_id}],
+        "get_friend_list": [{"user_id": friend_id}],
+    }
+    event.bot = SimpleNamespace(call_action=AsyncMock(side_effect=targets.__getitem__))
+
+    result = collect(obj.forward_song, event)[0]
+    assert event.stopped
+    if expected.endswith("Message"):
+        assert "已转发" in result
+        obj.send_audio.assert_awaited_once_with(
+            f"qq-custom:{expected}:123", "song-id", "vocals", "song"
+        )
+    else:
+        assert expected in result
+        obj.send_audio.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("sender", "now"), [("user-b", 120), ("user-a", 700)])
+def test_forward_rejects_other_users_or_expired_songs(sender, now):
+    obj = plugin(now, {})
+    obj.state["last"]["group-a|user-a"] = {"completed_at": 100}
+    event = Event("/点歌转发 123", sender=sender)
+    event.get_platform_name = lambda: "aiocqhttp"
+    assert "原会话" in collect(obj.forward_song, event)[0]
+    obj.send_audio.assert_not_awaited()
 
 
 @pytest.mark.parametrize(("command", "kind"), [("vocals", "vocals"), ("accompanied", "mixed")])

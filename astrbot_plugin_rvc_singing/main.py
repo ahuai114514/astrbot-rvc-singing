@@ -52,7 +52,7 @@ def parse_request(text: str, defaults: dict) -> tuple[str, dict]:
     return text, options
 
 
-@register("astrbot_plugin_rvc_singing", "ahuai", "角色音色翻唱，支持B站点歌", "1.2.2")
+@register("astrbot_plugin_rvc_singing", "ahuai", "角色音色翻唱，支持B站点歌", "1.2.3")
 class RVCSinging(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -175,7 +175,7 @@ class RVCSinging(Star):
         }
         self.persist()
         return "120秒内回复序号选择演唱版本，回复0退出：\n" + "\n".join(
-            f"{i}. {r['title']}\n   {r['author']} · {r['duration']}\n   {r['url']}"
+            f"{i}. {r['title']}\n   {r['author']} · {r['duration']}\n{r['url']}"
             for i, r in enumerate(results, 1)
         )
 

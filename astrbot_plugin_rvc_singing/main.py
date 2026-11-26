@@ -22,7 +22,8 @@ HELP = (
     "/点歌 B站链接：直接生成，默认带伴奏\n"
     "默认从头唱，满60秒后寻找静音句尾，最长300秒\n"
     "末尾可加：纯人声、从60秒、升调2 或 降调2\n"
-    "/唱歌进度：查看当前任务\n"
+    "可以连续点歌，歌曲会依次生成\n"
+    "/唱歌进度：查看你在当前会话的全部任务\n"
     "/纯人声、/带伴奏：生成成功后10分钟内获取对应版本\n"
     "/点歌转发 群号或QQ号：10分钟内转发你的上一首\n"
     "示例：/点歌 BV1LiVKzFEVf 从60秒"
@@ -52,7 +53,7 @@ def parse_request(text: str, defaults: dict) -> tuple[str, dict]:
     return text, options
 
 
-@register("astrbot_plugin_rvc_singing", "ahuai", "角色音色翻唱，支持B站点歌", "1.2.3")
+@register("astrbot_plugin_rvc_singing", "ahuai", "角色音色翻唱，支持B站点歌", "1.2.4")
 class RVCSinging(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -65,17 +66,18 @@ class RVCSinging(Star):
         if self.state_path.is_file():
             self.state.update(json.loads(self.state_path.read_text(encoding="utf-8")))
             self.state.pop("usage", None)
+        # Older versions keyed pending entries by owner.
+        self.state["pending"] = {
+            pending["request_id"]: {**pending, "owner": pending.get("owner", key)}
+            for key, pending in self.state["pending"].items()
+        }
         self.client = httpx.AsyncClient(timeout=45, trust_env=False)
         self.tasks: dict[str, asyncio.Task] = {}
         self.lock = asyncio.Lock()
 
     async def initialize(self):
-        for owner, pending in list(self.state["pending"].items()):
-            if pending.get("job_id"):
-                self.tasks[owner] = asyncio.create_task(self.watch(owner, pending))
-            else:
-                # A saved idempotency key permits safe resubmission after reload.
-                self.tasks[owner] = asyncio.create_task(self.resume(owner, pending))
+        for request_id, pending in self.state["pending"].items():
+            self.tasks[request_id] = asyncio.create_task(self.track(pending))
         self.cleanup_audio()
 
     def persist(self):
@@ -179,11 +181,11 @@ class RVCSinging(Star):
             for i, r in enumerate(results, 1)
         )
 
-    async def accept(self, event: AstrMessageEvent, source: str, options: dict) -> str:
+    async def accept(
+        self, event: AstrMessageEvent, source: str, options: dict, title: str = ""
+    ) -> str:
         async with self.lock:
             owner = self.owner(event)
-            if owner in self.state["pending"]:
-                return "你已有一首歌正在生成，可用 /唱歌进度 查看。"
             now = time.time()
             event_id = str(
                 getattr(event.message_obj, "message_id", "") or uuid.uuid4().hex
@@ -191,28 +193,36 @@ class RVCSinging(Star):
             request_id = hashlib.sha256(
                 f"{owner}|{event_id}|{source}|{options}".encode()
             ).hexdigest()
+            if request_id in self.state["pending"]:
+                return "这首歌已提交，可用 /唱歌进度 查看。"
             pending = {
+                "owner": owner,
                 "origin": event.unified_msg_origin,
                 "source": source,
+                "title": title,
                 "options": options,
                 "request_id": request_id,
                 "created": now,
             }
-            self.state["pending"][owner] = pending
+            self.state["pending"][request_id] = pending
             self.persist()
             try:
                 job = await self.submit(pending)
             except (httpx.TimeoutException, httpx.TransportError):
-                self.tasks[owner] = asyncio.create_task(self.resume(owner, pending))
+                self.tasks[request_id] = asyncio.create_task(self.track(pending))
                 return "请求已保存，正在确认网关任务状态；不会重复提交计费。"
             except Exception:
-                self.state["pending"].pop(owner, None)
+                self.state["pending"].pop(request_id, None)
                 self.persist()
                 raise
             pending["job_id"] = job["id"]
             self.persist()
-            self.tasks[owner] = asyncio.create_task(self.watch(owner, pending))
-            return "正在生成，最长300秒，可用 /唱歌进度 查看。\n生成成功后10分钟内可用 /纯人声 或 /带伴奏 获取对应版本。"
+            self.tasks[request_id] = asyncio.create_task(self.track(pending))
+            return (
+                f"已接单 · {job.get('title') or title or source}\n"
+                f"当前状态：{job['stage']}。可继续 /点歌，或用 /唱歌进度 查看。\n"
+                "完成后10分钟内可用 /纯人声 或 /带伴奏 获取对应版本。"
+            )
 
     async def submit(self, pending: dict):
         options = pending["options"]
@@ -228,26 +238,6 @@ class RVCSinging(Star):
             },
         )
 
-    async def resume(self, owner: str, pending: dict):
-        try:
-            while True:
-                try:
-                    job = await self.submit(pending)
-                    pending["job_id"] = job["id"]
-                    self.persist()
-                    await self.watch(owner, pending)
-                    return
-                except (httpx.TimeoutException, httpx.TransportError):
-                    await asyncio.sleep(15)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            self.state["pending"].pop(owner, None)
-            self.persist()
-            await self.send_text(pending["origin"], f"点歌失败：{self.describe(error)}")
-        finally:
-            self.tasks.pop(owner, None)
-
     @staticmethod
     def describe(error: Exception) -> str:
         return (
@@ -256,8 +246,18 @@ class RVCSinging(Star):
             else f"连接或处理失败（{type(error).__name__}）"
         )
 
-    async def watch(self, owner: str, pending: dict):
+    async def track(self, pending: dict):
+        request_id = pending["request_id"]
         try:
+            # Reuse the saved request ID when the first response was lost.
+            while not pending.get("job_id"):
+                try:
+                    job = await self.submit(pending)
+                except (httpx.TimeoutException, httpx.TransportError):
+                    await asyncio.sleep(15)
+                    continue
+                pending["job_id"] = job["id"]
+                self.persist()
             while True:
                 try:
                     job = await self.request("GET", f"/v1/jobs/{pending['job_id']}")
@@ -265,7 +265,7 @@ class RVCSinging(Star):
                     await asyncio.sleep(15)
                     continue
                 if job["status"] == "success":
-                    self.state["last"][owner] = {
+                    self.state["last"][pending["owner"]] = {
                         "job_id": job["id"],
                         "title": job["title"],
                         "kind": pending["options"]["kind"],
@@ -286,14 +286,15 @@ class RVCSinging(Star):
             raise
         except Exception as error:
             logger.warning("[rvc-singing] task failed: %s", type(error).__name__)
+            title = pending.get("title") or pending["source"]
             await self.send_text(
-                pending["origin"], f"唱歌任务失败：{self.describe(error)}"
+                pending["origin"], f"《{title}》唱歌任务失败：{self.describe(error)}"
             )
         finally:
             if not asyncio.current_task().cancelling():
-                self.state["pending"].pop(owner, None)
+                self.state["pending"].pop(request_id, None)
                 self.persist()
-            self.tasks.pop(owner, None)
+            self.tasks.pop(request_id, None)
 
     @staticmethod
     def argument(event: AstrMessageEvent, name: str) -> str:
@@ -363,28 +364,35 @@ class RVCSinging(Star):
             if not value.isdigit() or not 1 <= int(value) <= len(selection["results"]):
                 yield event.plain_result("请直接回复候选列表中的序号，例如 1")
                 return
-            source = selection["results"][int(value) - 1]["url"]
+            song = selection["results"][int(value) - 1]
             yield event.plain_result(
-                await self.accept(event, source, selection["options"])
+                await self.accept(event, song["url"], selection["options"], song["title"])
             )
         except Exception as error:
             yield event.plain_result(self.describe(error))
 
     @filter.command("唱歌进度")
     async def progress(self, event: AstrMessageEvent):
-        pending = self.state["pending"].get(self.owner(event))
-        if not pending:
+        owner = self.owner(event)
+        tasks = [
+            task for task in self.state["pending"].values() if task["owner"] == owner
+        ]
+        if not tasks:
             yield event.plain_result("当前没有正在生成的歌曲。")
             return
-        try:
-            if not pending.get("job_id"):
-                text = "正在确认网关受理结果。"
-            else:
-                job = await self.request("GET", f"/v1/jobs/{pending['job_id']}")
-                text = f"当前进度：{job['stage']}\n任务：{job['id']}"
-            yield event.plain_result(text)
-        except Exception as error:
-            yield event.plain_result(self.describe(error))
+        lines = ["你的点歌进度"]
+        for number, task in enumerate(tasks, 1):
+            title = task.get("title") or task["source"]
+            stage = "正在确认网关受理结果"
+            if job_id := task.get("job_id"):
+                try:
+                    job = await self.request("GET", f"/v1/jobs/{job_id}")
+                    title = job.get("title") or title
+                    stage = job["stage"]
+                except Exception as error:
+                    stage = self.describe(error)
+            lines.append(f"{number}. {title} · {stage}")
+        yield event.plain_result("\n".join(lines))
 
     async def repeat(self, event: AstrMessageEvent, kind: str):
         event.stop_event()
@@ -506,8 +514,9 @@ class RVCSinging(Star):
                 return "没有有效候选列表，请先搜索。"
             if not 1 <= choice <= len(selection["results"]):
                 return "序号不在候选列表中。"
+            song = selection["results"][choice - 1]
             return await self.accept(
-                event, selection["results"][choice - 1]["url"], selection["options"]
+                event, song["url"], selection["options"], song["title"]
             )
         except Exception as error:
             return self.describe(error)

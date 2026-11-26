@@ -2,11 +2,14 @@
 
 import ast
 import asyncio
+import hashlib
 import re
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 SOURCE = Path(__file__).parents[1] / "astrbot_plugin_rvc_singing" / "main.py"
@@ -27,6 +30,9 @@ def plugin(now, selections):
             "vocals",
             "accompanied",
             "forward_song",
+            "accept",
+            "progress",
+            "track",
         }:
             node.decorator_list = []
             if node.name == "argument":
@@ -47,6 +53,10 @@ def plugin(now, selections):
     module = ast.fix_missing_locations(ast.Module(body=[*constants, cls], type_ignores=[]))
     scope = {
         "re": re,
+        "asyncio": asyncio,
+        "hashlib": hashlib,
+        "httpx": httpx,
+        "uuid": uuid,
         "AstrMessageEvent": object,
         "MessageType": SimpleNamespace(
             GROUP_MESSAGE=SimpleNamespace(value="GroupMessage"),
@@ -79,7 +89,7 @@ class Event:
 def selection(created=100):
     return {
         "created": created,
-        "results": [{"url": "first"}, {"url": "second"}],
+        "results": [{"url": "first", "title": "第一首"}, {"url": "second", "title": "第二首"}],
         "options": {"start": 60, "kind": "mixed"},
     }
 
@@ -91,12 +101,59 @@ def collect(handler, event):
     return asyncio.run(run())
 
 
+def test_same_sender_can_queue_multiple_jobs_and_check_progress():
+    async def run():
+        obj = plugin(120, {})
+        obj.accept = type(obj).accept.__get__(obj)
+        obj.state["pending"] = {}
+        obj.tasks = {}
+        obj.lock = asyncio.Lock()
+        obj.submit = AsyncMock(
+            side_effect=[
+                {"id": "one", "stage": "生成中"},
+                {"id": "two", "stage": "排队中"},
+            ]
+        )
+        wait_for_result = asyncio.Event()
+
+        async def get_job(method, path):
+            job_id = path.rsplit("/", 1)[-1]
+            if asyncio.current_task() is current:
+                return {"stage": {"one": "生成中", "two": "排队中"}[job_id]}
+            await wait_for_result.wait()
+            return {"id": job_id, "status": "success", "title": job_id}
+
+        current = asyncio.current_task()
+        obj.request = get_job
+        event = Event("")
+        event.message_obj = SimpleNamespace(message_id="1")
+        options = {"kind": "mixed"}
+        assert "生成中" in await obj.accept(event, "first", options, "第一首")
+        assert "已提交" in await obj.accept(event, "first", options, "第一首")
+        event.message_obj.message_id = "2"
+        assert "排队中" in await obj.accept(event, "second", options, "第二首")
+        assert [line async for line in obj.progress(event)] == [
+            "你的点歌进度\n1. 第一首 · 生成中\n2. 第二首 · 排队中"
+        ]
+        assert [line async for line in obj.progress(Event("", sender="user-b"))] == [
+            "当前没有正在生成的歌曲。"
+        ]
+        tasks = list(obj.tasks.values())
+        wait_for_result.set()
+        await asyncio.gather(*tasks)
+        assert obj.send_audio.await_count == 2
+        assert obj.state["pending"] == {}
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(("number", "source"), [("1", "first"), ("2", "second")])
 def test_plain_number_selects_same_sender_in_same_conversation(number, source):
     obj = plugin(219, {"group-a|user-a": selection()})
     event = Event(number)
     assert collect(obj.select_number, event) == ["accepted"]
-    obj.accept.assert_awaited_once_with(event, source, selection()["options"])
+    song = selection()["results"][int(number) - 1]
+    obj.accept.assert_awaited_once_with(event, source, selection()["options"], song["title"])
     assert event.stopped
 
 
@@ -162,7 +219,7 @@ def test_legacy_command_still_selects():
     obj = plugin(120, {"group-a|user-a": selection()})
     event = Event("/选歌 2")
     assert collect(obj.select, event) == ["accepted"]
-    obj.accept.assert_awaited_once_with(event, "second", selection()["options"])
+    obj.accept.assert_awaited_once_with(event, "second", selection()["options"], "第二首")
 
 
 @pytest.mark.parametrize(

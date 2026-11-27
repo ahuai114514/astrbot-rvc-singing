@@ -53,7 +53,7 @@ def parse_request(text: str, defaults: dict) -> tuple[str, dict]:
     return text, options
 
 
-@register("astrbot_plugin_rvc_singing", "ahuai", "角色音色翻唱，支持B站点歌", "1.2.4")
+@register("astrbot_plugin_rvc_singing", "ahuai", "角色音色翻唱，支持B站点歌", "1.2.5")
 class RVCSinging(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)

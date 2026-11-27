@@ -397,7 +397,8 @@ def test_video_input_canonicalizes_to_bilibili():
         video_url("https://b23.tv.evil.example/abc")
 
 
-def test_download_uses_range_and_backup_cdn(tmp_path, monkeypatch):
+@pytest.mark.parametrize("view_code", [0, -404])
+def test_download_uses_range_and_backup_cdn(tmp_path, monkeypatch, view_code):
     from gateway import media
 
     async def unavailable(*args, **kwargs):
@@ -411,10 +412,19 @@ def test_download_uses_range_and_backup_cdn(tmp_path, monkeypatch):
 
         def handle(request):
             if request.url.path.endswith("/view"):
+                if view_code == -404:
+                    return httpx.Response(200, json={"code": -404})
                 return httpx.Response(
                     200, json={"code": 0, "data": {"cid": 1, "title": "song"}}
                 )
+            if request.url.path.endswith("/pagelist"):
+                assert view_code == -404
+                assert request.url.params["bvid"] == "BV1LiVKzFEVf"
+                return httpx.Response(
+                    200, json={"code": 0, "data": [{"cid": 2, "part": "first page"}]}
+                )
             if request.url.path.endswith("/playurl"):
+                assert request.url.params["cid"] == ("2" if view_code == -404 else "1")
                 return httpx.Response(
                     200,
                     json={
@@ -442,7 +452,8 @@ def test_download_uses_range_and_backup_cdn(tmp_path, monkeypatch):
         path, title = await bili.download(
             "https://www.bilibili.com/video/BV1LiVKzFEVf", tmp_path
         )
-        assert title == "song" and path.read_bytes() == b"audio" * 100
+        assert title == ("first page" if view_code == -404 else "song")
+        assert path.read_bytes() == b"audio" * 100
         assert not list(tmp_path.glob("*.part"))
         await bili.close()
 

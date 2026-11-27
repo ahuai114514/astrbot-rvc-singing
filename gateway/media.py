@@ -245,14 +245,28 @@ class Bilibili:
         )
         response.raise_for_status()
         view = response.json()
-        if view.get("code") != 0:
+        if view.get("code") == 0:
+            info = view["data"]
+            cid, title = info["cid"], info["title"]
+        elif view.get("code") == -404:
+            # Bilibili can still expose the first page when video details are unavailable.
+            response = await self.client.get(
+                "https://api.bilibili.com/x/player/pagelist", params={"bvid": bvid}
+            )
+            response.raise_for_status()
+            pages = response.json()
+            entries = pages.get("data")
+            if pages.get("code") != 0 or not entries or not entries[0].get("cid"):
+                raise ValueError("B 站视频不可访问，请检查链接或更新 Cookie")
+            cid = entries[0]["cid"]
+            title = entries[0].get("part") or bvid
+        else:
             raise ValueError("B 站视频不可访问，请检查链接或更新 Cookie")
-        info = view["data"]
         response = await self.client.get(
             "https://api.bilibili.com/x/player/playurl",
             params={
                 "bvid": bvid,
-                "cid": info["cid"],
+                "cid": cid,
                 "fnval": 16,
                 "qn": 64,
             },
@@ -298,7 +312,7 @@ class Bilibili:
                 if size < 128:
                     continue
                 partial.replace(target)
-                return target, info["title"]
+                return target, title
             except httpx.HTTPError:
                 continue
             finally:
